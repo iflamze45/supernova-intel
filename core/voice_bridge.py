@@ -1,9 +1,11 @@
+import asyncio
 import hmac
 import json
 import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -192,12 +194,78 @@ class AckBody(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
 
 
+class FileBridgeStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"commands": [], "acks": []}
+        try:
+            value = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {"commands": [], "acks": []}
+        if not isinstance(value, dict):
+            return {"commands": [], "acks": []}
+        return {
+            "commands": list(value.get("commands", [])),
+            "acks": list(value.get("acks", [])),
+        }
+
+    def _write(self, value: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        temp.replace(self.path)
+
+    async def enqueue(self, record: dict[str, Any]) -> None:
+        async with self._lock:
+            value = self._read()
+            value["commands"] = (value["commands"] + [record])[-100:]
+            self._write(value)
+
+    async def poll(self, after: str | None) -> list[dict[str, Any]]:
+        async with self._lock:
+            value = self._read()
+            rows = value["commands"]
+            if after:
+                rows = [row for row in rows if str(row.get("timestamp", "")) > after]
+            pending = decode_pending_commands(rows)
+            value["commands"] = [
+                row
+                for row in value["commands"]
+                if any(item["id"] == row.get("id") for item in pending)
+            ]
+            self._write(value)
+            return pending
+
+    async def acknowledge(self, record: dict[str, Any]) -> None:
+        async with self._lock:
+            value = self._read()
+            value["acks"] = (value["acks"] + [record])[-100:]
+            self._write(value)
+
+    async def latest_state(self) -> dict[str, Any] | None:
+        async with self._lock:
+            value = self._read()
+            if not value["acks"]:
+                return None
+            try:
+                return json.loads(value["acks"][-1]["signal_type"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                return None
+
+
 def create_voice_bridge_router(
-    client_provider: Callable[[], Any],
+    store: FileBridgeStore | None = None,
     token_provider: Callable[[], str] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/voice-bridge", tags=["voice-bridge"])
     get_token = token_provider or (lambda: os.getenv("VOICE_VIBE_BRIDGE_TOKEN", ""))
+    bridge_store = store or FileBridgeStore(
+        Path(os.getenv("VOICE_VIBE_BRIDGE_STORE", "/tmp/voice-vibe-bridge.json"))
+    )
 
     def authenticate(authorization: str | None) -> None:
         require_bridge_token(authorization, get_token())
@@ -209,7 +277,7 @@ def create_voice_bridge_router(
     ):
         authenticate(authorization)
         record = build_command_record(body.model_dump(exclude_none=True))
-        await client_provider().table("telemetry").insert(record).execute()
+        await bridge_store.enqueue(record)
         envelope = json.loads(record["signal_type"])
         return {
             "status": "queued",
@@ -223,22 +291,12 @@ def create_voice_bridge_router(
         authorization: str | None = Header(default=None),
     ):
         authenticate(authorization)
-        query = (
-            client_provider()
-            .table("telemetry")
-            .select("id,signal_type,timestamp")
-            .eq("module_name", COMMAND_MODULE)
-            .order("timestamp")
-            .limit(25)
-        )
         if after:
             try:
                 datetime.fromisoformat(after)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="invalid cursor") from exc
-            query = query.gt("timestamp", after)
-        result = await query.execute()
-        commands = decode_pending_commands(result.data or [])
+        commands = await bridge_store.poll(after)
         return {"commands": commands, "server_time": _utcnow().isoformat()}
 
     @router.post("/ack")
@@ -253,7 +311,7 @@ def create_voice_bridge_router(
             message=body.message,
             state=body.state,
         )
-        await client_provider().table("telemetry").insert(record).execute()
+        await bridge_store.acknowledge(record)
         return {"status": "acknowledged", "command_id": body.command_id}
 
     @router.get("/state")
@@ -261,21 +319,9 @@ def create_voice_bridge_router(
         authorization: str | None = Header(default=None),
     ):
         authenticate(authorization)
-        result = (
-            await client_provider()
-            .table("telemetry")
-            .select("signal_type,timestamp")
-            .eq("module_name", ACK_MODULE)
-            .order("timestamp", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if not result.data:
+        payload = await bridge_store.latest_state()
+        if not payload:
             return {"status": "waiting", "state": None}
-        try:
-            payload = json.loads(result.data[0]["signal_type"])
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=502, detail="invalid bridge state record") from exc
         return {
             "status": "online",
             "state": payload.get("state"),

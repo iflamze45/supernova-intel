@@ -229,7 +229,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
-app.include_router(create_voice_bridge_router(db))
+app.include_router(create_voice_bridge_router())
 
 
 # ── Health ────────────────────────────────────────────────────

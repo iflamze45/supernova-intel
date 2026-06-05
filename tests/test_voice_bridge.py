@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from core.voice_bridge import (
+    FileBridgeStore,
     build_ack_record,
     build_command_record,
     decode_pending_commands,
@@ -113,3 +114,27 @@ def test_build_ack_record_truncates_message_and_preserves_state():
     assert len(record["signal_type"]) < 1400
     assert '"command_id":"abc"' in record["signal_type"]
     assert '"enabled":true' in record["signal_type"]
+
+
+@pytest.mark.asyncio
+async def test_file_store_round_trip(tmp_path):
+    store = FileBridgeStore(tmp_path / "bridge.json")
+    command = build_command_record(
+        {"type": "command", "command": "silent"},
+        command_id="command-1",
+    )
+    ack = build_ack_record(
+        command_id="command-1",
+        ok=True,
+        message="done",
+        state={"enabled": True, "mode": "silent"},
+    )
+
+    await store.enqueue(command)
+    pending = await store.poll(after=None)
+    await store.acknowledge(ack)
+    latest = await store.latest_state()
+
+    assert pending[0]["id"] == "command-1"
+    assert latest["command_id"] == "command-1"
+    assert latest["state"]["mode"] == "silent"
