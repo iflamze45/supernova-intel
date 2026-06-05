@@ -11,3 +11,5 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: VOICE_VIBE_BRIDGE_TOKEN
+        sync: false

@@ -12,6 +12,8 @@ from postgrest.types import CountMethod  # type: ignore[attr-defined]
 from supabase import acreate_client
 from supabase._async.client import AsyncClient  # type: ignore[import-untyped]
 
+from core.voice_bridge import create_voice_bridge_router
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
@@ -208,12 +210,26 @@ async def _sqlite_repo_agent_status() -> dict[str, object]:
 
 
 app = FastAPI(title="The One System — Telemetry API (Postgres)", lifespan=lifespan)
+_ALLOWED_ORIGINS = [
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "https://the-one-system-ui.vercel.app",
+    "https://dashboard-one-liard-26.vercel.app",
+    *[
+        origin.strip()
+        for origin in os.getenv("EXTRA_CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ],
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+app.include_router(create_voice_bridge_router(db))
 
 
 # ── Health ────────────────────────────────────────────────────
