@@ -68,6 +68,66 @@ def test_apply_rules_updates_only_managed_voice_settings(tmp_path):
     assert "VOICE_ALLOW_EVENTS=verify_pass,error" in text
 
 
+# voice.conf was sourced by say_hook.sh, so a newline in one event name became
+# its own config line and an embedded `$(...)` executed as a command.
+NEWLINE_INJECTION = 'verify_pass\nENABLED=$(touch /tmp/voice-vibe-pwned)'
+
+
+@pytest.mark.parametrize(
+    "event",
+    [NEWLINE_INJECTION, "$(id)", "`id`", "error;reboot", "error\rENABLED=true", "", "x" * 49],
+)
+def test_apply_rules_rejects_unsafe_event_names_without_writing(tmp_path, event):
+    conf = tmp_path / "voice.conf"
+    conf.write_text("PROFILE=build\nVOICE_ALLOW_EVENTS=error\n")
+    original = conf.read_text()
+
+    with pytest.raises(ValueError, match="event"):
+        apply_rules(conf, {"type": "rules", "allowed_events": [event], "policy": "strict"})
+
+    assert conf.read_text() == original
+
+
+def test_apply_rules_rejects_oversized_event_lists(tmp_path):
+    conf = tmp_path / "voice.conf"
+
+    with pytest.raises(ValueError, match="event"):
+        apply_rules(
+            conf,
+            {"type": "rules", "allowed_events": [f"event_{i}" for i in range(33)], "policy": "strict"},
+        )
+
+    assert not conf.exists()
+
+
+def test_agent_acknowledges_injected_rules_as_failed_without_writing(tmp_path):
+    conf = tmp_path / "voice.conf"
+    conf.write_text("PROFILE=build\n")
+    client = FakeClient(
+        [
+            {
+                "id": "command-evil",
+                "payload": {"type": "rules", "allowed_events": [NEWLINE_INJECTION], "policy": "strict"},
+                "created_at": "2026-09-15T12:00:00+00:00",
+                "expires_at": "2026-09-15T12:01:30+00:00",
+            }
+        ]
+    )
+    seen = []
+    agent = BridgeAgent(
+        client=client,
+        cursor_path=tmp_path / "cursor",
+        state_path=tmp_path / "state.json",
+        conf_path=conf,
+        runner=lambda command: seen.append(command) or "",
+    )
+
+    assert agent.run_once() == 1
+    assert client.acks[0]["ok"] is False
+    assert conf.read_text() == "PROFILE=build\n"
+    assert seen == []
+
+
 def test_agent_persists_cursor_and_acknowledges_execution(tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"enabled": True, "mode": "on"}))

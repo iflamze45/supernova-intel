@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -29,6 +30,10 @@ MANAGED_RULE_KEYS = {
     "VOICE_SPEAK_USER_TEXT",
     "VOICE_REPORT_POLICY",
 }
+# Mirrors core/voice_bridge.py. Re-checked here because payloads arrive over the
+# network and voice.conf is read by shell tooling on this machine.
+EVENT_PATTERN = re.compile(r"^[a-z0-9_]{1,48}$")
+MAX_EVENTS = 32
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -44,12 +49,25 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def apply_rules(conf_path: Path, payload: dict[str, Any]) -> None:
-    events = []
-    for raw in payload.get("allowed_events", []):
-        event = str(raw).strip().lower().replace(" ", "_")
-        if event and event not in events:
+def normalize_events(raw_events: Any) -> list[str]:
+    if not isinstance(raw_events, list):
+        raise ValueError("allowed events must be a list of event names")
+    events: list[str] = []
+    for raw in raw_events:
+        if not isinstance(raw, str):
+            raise ValueError("event names must be strings")
+        event = raw.strip().lower().replace(" ", "_")
+        if not EVENT_PATTERN.fullmatch(event):
+            raise ValueError("invalid voice event name")
+        if event not in events:
             events.append(event)
+    if len(events) > MAX_EVENTS:
+        raise ValueError(f"too many voice events (max {MAX_EVENTS})")
+    return events
+
+
+def apply_rules(conf_path: Path, payload: dict[str, Any]) -> None:
+    events = normalize_events(payload.get("allowed_events", []))
     policy = payload.get("policy")
     if policy not in {"strict", "open"}:
         raise ValueError("unsupported voice policy")
